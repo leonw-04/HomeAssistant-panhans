@@ -3178,7 +3178,12 @@ variables:
 
     {% if trigger_id_defined and trigger.id == 'temperature_change_liming_protection_off' %}
       {% for info in trigger.event.data.restore_information %}
-        {% set n.dict = n.dict + [(info['entity_id'], [{'mode': info['state'] , 'temp': info['temperature']}])] %}
+        {% set n.dict = n.dict + [(info['entity_id'], [{
+          'mode': info['state'],
+          'temp': info['temperature'],
+          'low': info.get('target_temp_low'),
+          'high': info.get('target_temp_high')
+        }])] %}
       {% endfor %}
 
       {{ dict.from_keys(n.dict) }}
@@ -3191,10 +3196,17 @@ variables:
         {% for valve in input_trvs %}
 
           {% set current_valve_temp = state_attr(valve, 'current_temperature') | float(20) %}
-          {% set current_valve_target_temp = state_attr(valve, 'temperature') | float(temperature) %}
+          {% set supports_range = (state_attr(valve, 'supported_features') | int(0) % 4) >= 2 %}
+          {% set current_valve_target_low = state_attr(valve, 'target_temp_low') | float(none) %}
+          {% set current_valve_target_high = state_attr(valve, 'target_temp_high') | float(none) %}
+          {% set current_valve_target_temp = state_attr(valve, 'temperature') | float(none) %}
+          {% if current_valve_target_temp == none and supports_range %}
+            {% set current_valve_target_temp = iif(states(valve) == 'cool', current_valve_target_high, current_valve_target_low) %}
+          {% endif %}
           {% set current_valve_mode = states(valve) %}
           {% set min_temp = state_attr(valve, 'min_temp') | float(5) %}
           {% set max_temp = state_attr(valve, 'max_temp') | float(30) %}
+          {% set step = state_attr(valve, 'target_temp_step') | float(0.5) %}
 
           {% set valve_temp = target_temperature %}
 
@@ -3256,10 +3268,35 @@ variables:
           {% set valve_temp = iif(set_max_temperature, max_temp, valve_temp) %}
           {% set valve_temp = iif(valve_temp > max_temp, max_temp, valve_temp) %}
           {% set valve_temp = iif(valve_temp < min_temp, min_temp, valve_temp) %}
-          {% set valve_temp = valve_temp | round(1) %}
+          {% set valve_temp = (valve_temp / step) | round(0) * step %}
+          {% set valve_temp = iif(valve_temp > max_temp, max_temp, valve_temp) %}
+          {% set valve_temp = iif(valve_temp < min_temp, min_temp, valve_temp) %}
 
           {% if current_valve_mode != valve_mode or current_valve_target_temp != valve_temp %}
-            {% set n.dict = n.dict + [(valve, [{'mode': valve_mode , 'temp': valve_temp}])] %}
+            {% set change = {'mode': valve_mode, 'temp': valve_temp} %}
+            {% if supports_range %}
+              {% set range_low = current_valve_target_low | float(min_temp) %}
+              {% set range_high = current_valve_target_high | float(max_temp) %}
+              {% set range_low = iif(range_low > max_temp, max_temp, range_low) %}
+              {% set range_low = iif(range_low < min_temp, min_temp, range_low) %}
+              {% set range_high = iif(range_high > max_temp, max_temp, range_high) %}
+              {% set range_high = iif(range_high < min_temp, min_temp, range_high) %}
+              {% set range_low = (range_low / step) | round(0) * step %}
+              {% set range_high = (range_high / step) | round(0) * step %}
+              {% set range_low = iif(range_low > max_temp, max_temp, range_low) %}
+              {% set range_low = iif(range_low < min_temp, min_temp, range_low) %}
+              {% set range_high = iif(range_high > max_temp, max_temp, range_high) %}
+              {% set range_high = iif(range_high < min_temp, min_temp, range_high) %}
+              {% if valve_mode == 'cool' %}
+                {% set range_high = valve_temp %}
+                {% set range_high = iif(range_high < range_low, range_low, range_high) %}
+              {% else %}
+                {% set range_low = valve_temp %}
+                {% set range_low = iif(range_low > range_high, range_high, range_low) %}
+              {% endif %}
+              {% set change = {'mode': valve_mode, 'temp': valve_temp, 'low': range_low, 'high': range_high} %}
+            {% endif %}
+            {% set n.dict = n.dict + [(valve, [change])] %}
           {% endif %}
 
         {% endfor %}
@@ -3576,9 +3613,11 @@ variables:
 
     {% for valve in input_trvs %}
       {% set temperature = state_attr(valve,'temperature') %}
+      {% set target_temp_low = state_attr(valve,'target_temp_low') %}
+      {% set target_temp_high = state_attr(valve,'target_temp_high') %}
       {% set current_temperature = state_attr(valve,'current_temperature') %}
       {% set state = states(valve) %}
-      {% set n.dict = n.dict + [{'entity_id': valve, 'state': state, 'temperature': temperature, 'current_temperature': current_temperature}] %}
+      {% set n.dict = n.dict + [{'entity_id': valve, 'state': state, 'temperature': temperature, 'target_temp_low': target_temp_low, 'target_temp_high': target_temp_high, 'current_temperature': current_temperature}] %}
     {% endfor %}
 
     {{ n.dict }}
@@ -3889,6 +3928,9 @@ actions:
                         thermostat: "{{ (changes.keys() | list) [index] }}"
                         mode: "{{ (((changes.values() | list) [index]) | first) ['mode'] }}"
                         temp_target: "{{ (((changes.values() | list) [index]) | first) ['temp'] }}"
+                        temp_target_low: "{{ (((changes.values() | list) [index]) | first).get('low') }}"
+                        temp_target_high: "{{ (((changes.values() | list) [index]) | first).get('high') }}"
+                        supports_temperature_range: "{{ (state_attr(thermostat, 'supported_features') | int(0) % 4) >= 2 }}"
                     - action: system_log.write
                       data:
                         message: >
@@ -3915,12 +3957,28 @@ actions:
                         - condition: template
                           value_template: "{{ not is_minimal_config or minimal_config_bypass }}"
                         - condition: template
-                          value_template: "{{ state_attr(thermostat, 'temperature') != temp_target and mode != 'off' }}"
+                          value_template: >
+                            {{ mode != 'off' and (
+                              (supports_temperature_range and
+                                (state_attr(thermostat, 'target_temp_low') | float(none) != temp_target_low | float(none) or
+                                 state_attr(thermostat, 'target_temp_high') | float(none) != temp_target_high | float(none))) or
+                              (not supports_temperature_range and state_attr(thermostat, 'temperature') != temp_target)
+                            ) }}
                       then:
-                        - action: climate.set_temperature
-                          data:
-                            entity_id: "{{ thermostat }}"
-                            temperature: "{{ temp_target | float }}"
+                        - if:
+                            - condition: template
+                              value_template: "{{ supports_temperature_range }}"
+                          then:
+                            - action: climate.set_temperature
+                              data:
+                                entity_id: "{{ thermostat }}"
+                                target_temp_low: "{{ temp_target_low | float }}"
+                                target_temp_high: "{{ temp_target_high | float }}"
+                          else:
+                            - action: climate.set_temperature
+                              data:
+                                entity_id: "{{ thermostat }}"
+                                temperature: "{{ temp_target | float }}"
                         - delay: !input input_action_call_delay
               - if:
                   - condition: template
