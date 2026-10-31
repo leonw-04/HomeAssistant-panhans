@@ -105,6 +105,19 @@ blueprint:
                     - temperature
               multiple: false
 
+        input_fallback_to_internal_temperature:
+          name: 🔄️ Fallback to Internal Temperature
+          description: >
+            `optional`
+
+
+            If the external room temperature sensor is unavailable or has a non-numeric state,
+            use each thermostat's own `current_temperature` for temperature control. External
+            temperature calibration is suspended until the external sensor is available again.
+          default: false
+          selector:
+            boolean:
+
     comfort_temperature_section:
       name: Comfort Mode Settings
       icon: mdi:weather-sunny
@@ -1816,6 +1829,8 @@ trigger:
   - trigger: state
     entity_id: !input input_trvs
     attribute: temperature
+    not_to:
+      - null
     for:
       seconds: 5
     id: temperature_change_valve_target
@@ -2165,6 +2180,12 @@ trigger:
     for: !input input_calibration_timeout
 
   - trigger: state
+    id: temperature_change_internal_temperature
+    entity_id: !input input_trvs
+    attribute: current_temperature
+    for: !input input_action_call_delay
+
+  - trigger: state
     id: calibration_aggressive_mode_thermostat_temp_change
     entity_id: !input input_trvs
     attribute: temperature
@@ -2178,6 +2199,11 @@ trigger:
       seconds: 30
 
   # calibration trigger
+  - trigger: state
+    id: temperature_change_temperature_sensor
+    entity_id: !input input_temperature_sensor
+    for: !input input_action_call_delay
+
   - trigger: state
     id: calibration_sensor_change
     entity_id: !input input_temperature_sensor
@@ -2318,6 +2344,7 @@ variables:
   input_hvac_mode_eco: !input input_hvac_mode_eco
   input_hvac_mode_comfort: !input input_hvac_mode_comfort
   input_temperature_sensor: !input input_temperature_sensor
+  input_fallback_to_internal_temperature: !input input_fallback_to_internal_temperature
 
   # temperatures
   input_temperature_comfort: !input input_temperature_comfort
@@ -2459,7 +2486,38 @@ variables:
     {% endif %}
 
   valid_temperature_sensor: >
-    {{ value_temperature_sensor not in invalid_states }}
+    {{ value_temperature_sensor not in invalid_states and is_number(value_temperature_sensor) }}
+
+  has_valid_internal_temperature: >
+    {% set result = namespace(value=false) %}
+    {% for valve in input_trvs %}
+      {% if is_number(state_attr(valve, 'current_temperature')) %}
+        {% set result.value = true %}
+      {% endif %}
+    {% endfor %}
+    {{ result.value }}
+
+  active_temperature_source: >
+    {% if valid_temperature_sensor %}
+      external
+    {% elif input_fallback_to_internal_temperature and has_valid_internal_temperature %}
+      internal_fallback
+    {% else %}
+      unavailable
+    {% endif %}
+
+  temperature_sources: >
+    {% set result = namespace(values=[]) %}
+    {% for valve in input_trvs %}
+      {% set source = 'unavailable' %}
+      {% if valid_temperature_sensor %}
+        {% set source = 'external' %}
+      {% elif input_fallback_to_internal_temperature and is_number(state_attr(valve, 'current_temperature')) %}
+        {% set source = 'internal_fallback' %}
+      {% endif %}
+      {% set result.values = result.values + [{'thermostat': valve, 'source': source, 'temperature': state_attr(valve, 'current_temperature') if source == 'internal_fallback' else value_temperature_sensor}] %}
+    {% endfor %}
+    {{ result.values }}
 
   current_time_stamp: "{{ now() }}"
   is_metric: "{{ not is_temperature_sensor_defined or (is_temperature_sensor_defined and state_attr(input_temperature_sensor,VAR_UNIT_OF_MEASUREMENT) == '°C') }}"
@@ -3015,7 +3073,9 @@ variables:
         'scheduler' in trigger.id or
         'proximity' in trigger.id or
         'person' in trigger.id or
-        '_ds' in trigger.id)
+        '_ds' in trigger.id or
+        '_sensor' in trigger.id or
+        '_internal_temperature' in trigger.id)
         and not trigger.id == 'temperature_change_valve_target' }}
 
   set_max_temperature: "{{ is_force_max_temperature or is_liming_protection }}"
@@ -3035,7 +3095,7 @@ variables:
 
   change_temperature: >
     {% if trigger.id == 'temperature_change_valve_target' %}
-       {{ trigger.to_state.attributes.temperature | float }}
+       {{ trigger.to_state.attributes.get('temperature') | float(none) }}
     {% else %}
       {{ none }}
     {% endif %}
@@ -3195,7 +3255,10 @@ variables:
       {% else %}
         {% for valve in input_trvs %}
 
-          {% set current_valve_temp = state_attr(valve, 'current_temperature') | float(20) %}
+          {% set current_valve_temp_value = state_attr(valve, 'current_temperature') %}
+          {% set has_valid_valve_temperature = valid_temperature_sensor or
+              (input_fallback_to_internal_temperature and is_number(current_valve_temp_value)) %}
+          {% set current_valve_temp = current_valve_temp_value | float(0) %}
           {% set supports_range = (state_attr(valve, 'supported_features') | int(0) % 4) >= 2 %}
           {% set current_valve_target_low = state_attr(valve, 'target_temp_low') | float(none) %}
           {% set current_valve_target_high = state_attr(valve, 'target_temp_high') | float(none) %}
@@ -3241,7 +3304,7 @@ variables:
 
             {% endif %}
 
-            {% if input_calibration_generic %}
+            {% if input_calibration_generic and valid_temperature_sensor %}
 
               {% if current_valve_temp != ref_temp %}
                 {% set offset = current_valve_temp - ref_temp %}
@@ -3272,7 +3335,7 @@ variables:
           {% set valve_temp = iif(valve_temp > max_temp, max_temp, valve_temp) %}
           {% set valve_temp = iif(valve_temp < min_temp, min_temp, valve_temp) %}
 
-          {% if current_valve_mode != valve_mode or current_valve_target_temp != valve_temp %}
+          {% if has_valid_valve_temperature and (current_valve_mode != valve_mode or current_valve_target_temp != valve_temp) %}
             {% set change = {'mode': valve_mode, 'temp': valve_temp} %}
             {% if supports_range %}
               {% set range_low = current_valve_target_low | float(min_temp) %}
@@ -3435,31 +3498,34 @@ variables:
       {% for valve in valves_tado %}
 
         {% set offset_old = state_attr(valve, 'offset_celsius') | float(0) %}
-        {% set local_temperature = state_attr(valve, 'current_temperature') | float %}
+        {% set local_temperature_value = state_attr(valve, 'current_temperature') %}
+        {% set local_temperature = local_temperature_value | float(0) %}
         {% set calibration_sensor_temperature = value_temperature_sensor | float %}
 
-        {% set offset_new = (-(local_temperature - calibration_sensor_temperature) + offset_old) %}
+        {% if is_number(local_temperature_value) %}
+          {% set offset_new = (-(local_temperature - calibration_sensor_temperature) + offset_old) %}
 
-        {% if is_aggressive_mode_calibration %}
-          {% set temp_diff = state_attr(valve,'temperature') | float(target_temperature) - calibration_sensor_temperature %}
+          {% if is_aggressive_mode_calibration %}
+            {% set temp_diff = state_attr(valve,'temperature') | float(target_temperature) - calibration_sensor_temperature %}
 
-          {% if temp_diff * factor < input_aggressive_mode_range * -1 %}
-            {% set offset_new = offset_new + input_aggressive_mode_offset * factor %}
-          {% elif temp_diff * factor > input_aggressive_mode_range %}
-            {% set offset_new = offset_new - input_aggressive_mode_offset * factor %}
+            {% if temp_diff * factor < input_aggressive_mode_range * -1 %}
+              {% set offset_new = offset_new + input_aggressive_mode_offset * factor %}
+            {% elif temp_diff * factor > input_aggressive_mode_range %}
+              {% set offset_new = offset_new - input_aggressive_mode_offset * factor %}
+            {% endif %}
           {% endif %}
-        {% endif %}
 
-        {% set t_min = -10.9 %}
-        {% set t_max = 10.9 %}
+          {% set t_min = -10.9 %}
+          {% set t_max = 10.9 %}
 
-        {% set offset_new = iif(offset_new > t_max, t_max, offset_new) %}
-        {% set offset_new = iif(offset_new < t_min, t_min, offset_new) %}
+          {% set offset_new = iif(offset_new > t_max, t_max, offset_new) %}
+          {% set offset_new = iif(offset_new < t_min, t_min, offset_new) %}
 
-        {% set offset_new = offset_new | round(1) %}
+          {% set offset_new = offset_new | round(1) %}
 
-        {% if (float(offset_old) - float(offset_new)) | abs >= float(input_calibration_delta) %}
-          {% set n.dict = n.dict + [(valve, [{'value': offset_new }])] %}
+          {% if (float(offset_old) - float(offset_new)) | abs >= float(input_calibration_delta) %}
+            {% set n.dict = n.dict + [(valve, [{'value': offset_new }])] %}
+          {% endif %}
         {% endif %}
 
       {% endfor %}
@@ -3478,7 +3544,7 @@ variables:
                                     selectattr('entity_id', 'search', input_calibration_key_word) |
                                     map(attribute='entity_id') | list | first | default(none) %}
 
-        {% if calibration_entity is not none %}
+        {% if calibration_entity is not none and is_number(state_attr(valve, 'current_temperature')) %}
 
           {% set fallback_min = iif('external' in calibration_entity, 0, -12)%}
           {% set fallback_max = iif('external' in calibration_entity, 50, 12)%}
@@ -3579,7 +3645,8 @@ variables:
   allow_changes: >
     {% if is_minimal_config %}
       {{ minimal_config_bypass }}
-    {% elif is_temperature_sensor_defined and not valid_temperature_sensor %}
+    {% elif is_temperature_sensor_defined and not valid_temperature_sensor and
+            (not input_fallback_to_internal_temperature or not has_valid_internal_temperature) %}
       {{ false }}
     {% else %}
       {{ true }}
@@ -3703,6 +3770,8 @@ actions:
           fallback_comfort_temperature: "{{ fallback_comfort_temperature }}"
           target_temperature: "{{ target_temperature }}"
           set_max_temperature: "{{ set_max_temperature }}"
+          active_temperature_source: "{{ active_temperature_source }}"
+          temperature_sources: "{{ temperature_sources }}"
           last_trigger_id: "{{ iif(trigger_id_defined, trigger.id, '') }}"
           calibration_trigger: "{{ is_generic_calibration_trigger or calibration_trigger }}"
           change_trigger: "{{ change_trigger }}"
@@ -3768,6 +3837,7 @@ actions:
                     - delay: !input input_action_call_delay
 
                 - action: number.set_value
+                  continue_on_error: true
                   data:
                     value: "{{ float(calibration_value) }}"
                   target:
@@ -3937,6 +4007,7 @@ actions:
                           AHC - Change - {{ automation_name }} {{" \n "}}
                           Trigger ID: {{ iif(trigger_id_defined, trigger.id, '') }}
                           Thermostat: {{ thermostat }} {{" \n "}}
+                          Temperature Source: {{ (temperature_sources | selectattr('thermostat', 'eq', thermostat) | map(attribute='source') | first | default('unavailable')) }} {{" \n "}}
                           Mode: {{ mode }} {{" \n "}}
                           New Target Temp: {{ temp_target }} {{" \n "}}
                           Current Target Temp: {{ state_attr(thermostat,'temperature') }}
