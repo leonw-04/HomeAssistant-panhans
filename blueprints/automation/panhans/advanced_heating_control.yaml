@@ -48,7 +48,7 @@ blueprint:
     [![Open your Home Assistant instance and show an integration.](https://my.home-assistant.io/badges/integration.svg)](https://my.home-assistant.io/redirect/integration/?domain=uptime)
 
 
-    **Version**: 5.5.9.1
+    **Version**: 5.5.9.2
 
     **Help & FAQ**: [Advanced Heating Control](https://community.home-assistant.io/t/advanced-heating-control/469873)
 
@@ -795,6 +795,23 @@ blueprint:
           default: false
           selector:
             boolean:
+
+        input_manual_temperature_minutes:
+          name: ⏱️ Manuelle Temperatur – Dauer
+          description: >
+            Nach dieser Zeit ohne weitere Solltemperaturänderung wird wieder der
+            aktuelle Eco-/Comfort-Wert einschließlich Adjustments verwendet.
+            Gilt für Änderungen am Thermostat und im Dashboard.
+            0 deaktiviert die Rückstellung. Neustart oder Automations-Neuladen
+            bricht eine laufende Wartezeit ab; die nächste Sollwertänderung startet sie neu.
+          default: 30
+          selector:
+            number:
+              min: 0
+              max: 240
+              step: 5
+              unit_of_measurement: min
+              mode: slider
 
         input_reset_temperature:
           name: ↩️ Reset Temperature
@@ -1824,6 +1841,17 @@ trigger:
     for:
       seconds: 5
     id: temperature_change_available
+
+  # Re-evaluate the current schedule after a stable thermostat target.
+  # Automatic target changes may also fire this; applying the current plan is idempotent.
+  - trigger: state
+    entity_id: !input input_trvs
+    attribute: temperature
+    not_to:
+      - null
+    for:
+      minutes: !input input_manual_temperature_minutes
+    id: temperature_change_manual_expired
 
   # physical change
   - trigger: state
@@ -2912,6 +2940,9 @@ variables:
   valves_calibration_common: "{{ valves | reject('in', valves_tado) | list }}"
 
   # global
+  manual_temperature_minutes: !input input_manual_temperature_minutes
+  is_manual_expiry: "{{ trigger.id | default('') == 'temperature_change_manual_expired' and manual_temperature_minutes | float(0) > 0 }}"
+
   last_comfort_entity_change: "{{ [input_temperature_comfort_entity] | expand | map(attribute='last_changed') | list | first | default(none) }}"
   last_eco_entity_change: "{{ [input_temperature_eco_entity] | expand | map(attribute='last_changed') | list | first | default(none) }}"
 
@@ -3007,7 +3038,7 @@ variables:
     {% endif %}
 
   entry_comfort_temp: >
-    {% if entry != none and 'comfort' in entry.keys() and (last_comfort_entity_change == none or as_datetime(entry_time) > as_datetime(last_comfort_entity_change)) %}
+    {% if entry != none and 'comfort' in entry.keys() and (is_manual_expiry or last_comfort_entity_change == none or as_datetime(entry_time) > as_datetime(last_comfort_entity_change)) %}
       {% set entry_temp = entry['comfort']%}
       {% if is_number(entry_temp) %}
         {{ entry_temp }}
@@ -3019,7 +3050,7 @@ variables:
     {% endif %}
 
   entry_eco_temp: >
-    {% if entry != none and 'eco' in entry.keys() and (last_eco_entity_change == none or as_datetime(entry_time) > as_datetime(last_eco_entity_change)) %}
+    {% if entry != none and 'eco' in entry.keys() and (is_manual_expiry or last_eco_entity_change == none or as_datetime(entry_time) > as_datetime(last_eco_entity_change)) %}
       {% set entry_temp = entry['eco']%}
       {% if is_number(entry_temp) %}
         {{ entry_temp }}
@@ -3105,7 +3136,7 @@ variables:
     (entry_comfort_temp != none or entry_eco_temp != none) }}"
 
   is_reset: >
-    {{ (is_reset_temperature and is_change_trigger) or
+    {{ is_manual_expiry or (is_reset_temperature and is_change_trigger) or
         is_physical_change or is_ui_change or (is_adjustment_trigger and input_sync_adjustments_with_entities) }}
 
   is_window_trigger: "{{ trigger_id_defined and 'temperature_change_window_' in trigger.id }}"
@@ -3194,14 +3225,14 @@ variables:
     {% endif %}
 
   temperature_comfort_of_entity: >
-    {% if(input_temperature_comfort_entity != none) %}
+    {% if input_temperature_comfort_entity != none and not is_manual_expiry %}
       {{ states(input_temperature_comfort_entity) | float }}
     {% else %}
       {{ none }}
     {% endif %}
 
   temperature_eco_of_entity: >
-    {% if(input_temperature_eco_entity != none) %}
+    {% if input_temperature_eco_entity != none and not is_manual_expiry %}
       {{ states(input_temperature_eco_entity) | float }}
     {% else %}
       {{ none }}
@@ -3448,7 +3479,14 @@ variables:
   # reset temperature
   reset_data: >
     {% set result = [] %}
-    {% if is_adjustment_trigger %}
+    {% if is_manual_expiry %}
+      {% if input_temperature_comfort_entity != none %}
+        {% set result = result + [{'entity': input_temperature_comfort_entity, 'temp': temperature_comfort}] %}
+      {% endif %}
+      {% if input_temperature_eco_entity != none %}
+        {% set result = result + [{'entity': input_temperature_eco_entity, 'temp': temperature_eco}] %}
+      {% endif %}
+    {% elif is_adjustment_trigger %}
       {% if entry_comfort_temp != none and input_temperature_comfort_entity != none %}
         {% set result = result + [{'entity': input_temperature_comfort_entity, 'temp': entry_comfort_temp}] %}
       {% endif %}
@@ -3690,6 +3728,8 @@ variables:
     {{ n.dict }}
 
 conditions:
+  - condition: template
+    value_template: "{{ trigger.id | default('') != 'temperature_change_manual_expired' or is_manual_expiry }}"
   - condition: or
     conditions:
       - condition: template
