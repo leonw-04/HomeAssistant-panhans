@@ -3840,6 +3840,13 @@ actions:
       - condition: template
         value_template: "{{ manual_detected }}"
     then:
+      - action: input_text.set_value
+        target:
+          entity_id: "{{ manual_expected_entity }}"
+        data:
+          value: >
+            {% set previous = states(manual_expected_entity) | from_json({}) %}
+            {{ dict(previous, **{trigger.entity_id: [trigger.to_state.attributes.get('temperature'), trigger.to_state.attributes.get('target_temp_low'), trigger.to_state.attributes.get('target_temp_high')]}) | to_json }}
       - action: input_number.set_value
         target:
           entity_id: "{{ manual_target_entity }}"
