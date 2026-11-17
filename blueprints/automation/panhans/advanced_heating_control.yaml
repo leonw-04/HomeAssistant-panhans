@@ -48,7 +48,7 @@ blueprint:
     [![Open your Home Assistant instance and show an integration.](https://my.home-assistant.io/badges/integration.svg)](https://my.home-assistant.io/redirect/integration/?domain=uptime)
 
 
-    **Version**: 5.5.9.2
+    **Version**: 5.5.9.3
 
     **Help & FAQ**: [Advanced Heating Control](https://community.home-assistant.io/t/advanced-heating-control/469873)
 
@@ -799,11 +799,13 @@ blueprint:
         input_manual_temperature_minutes:
           name: ⏱️ Manuelle Temperatur – Dauer
           description: >
-            Nach dieser Zeit ohne weitere Solltemperaturänderung wird wieder der
-            aktuelle Eco-/Comfort-Wert einschließlich Adjustments verwendet.
-            Gilt für Änderungen am Thermostat und im Dashboard.
-            0 deaktiviert die Rückstellung. Neustart oder Automations-Neuladen
-            bricht eine laufende Wartezeit ab; die nächste Sollwertänderung startet sie neu.
+            Raumweite Übersteuerung nach einer manuellen Sollwertänderung am Gerät
+            oder im Dashboard. Jede weitere Änderung startet die Dauer neu.
+            Benötigt die drei Speicher-Helfer unten, jeweils exklusiv pro Raum.
+            Ablaufzeit und Sollwert überstehen Neustarts. Verpasste Abläufe werden
+            beim Start/Neuladen und spätestens bei der nächsten Minutenprüfung nachgeholt.
+            Fenster, Heizfreigabe, Frostschutz und Party-/Maximalbetrieb haben Vorrang.
+            0 deaktiviert die zeitliche Übersteuerung. Ohne Helfer gilt die ursprüngliche AHC-Logik.
           default: 30
           selector:
             number:
@@ -812,6 +814,38 @@ blueprint:
               step: 5
               unit_of_measurement: min
               mode: slider
+        input_manual_until:
+          name: Manuell bis – Speicher
+          description: Eigener Datum-und-Uhrzeit-Helfer pro Raum. Einmalig auf 2000-01-01 00:00:00 setzen; keinen initial-Wert verwenden.
+          default: []
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+        input_manual_target:
+          name: Manueller Sollwert – Speicher
+          description: Eigener Zahlen-Helfer pro Raum (5–35 °C, Schritt 0,5; keinen initial-Wert verwenden).
+          default: []
+          selector:
+            entity:
+              filter:
+                - domain: input_number
+        input_manual_expected:
+          name: Zuletzt gesendete Sollwerte – Speicher
+          description: Eigener Text-Helfer pro Raum mit maximaler Länge 255. Verhindert, dass Geräte-Rückmeldungen eigener Heizbefehle als manuelle Eingaben gelten. Nicht manuell bearbeiten.
+          default: []
+          selector:
+            entity:
+              filter:
+                - domain: input_text
+        input_heating_status:
+          name: Heizungsgrund – Anzeige
+          description: Optionaler eigener Text-Helfer pro Raum (maximale Länge 255) für den aktuellen Steuerungsgrund im Dashboard.
+          default: []
+          selector:
+            entity:
+              filter:
+                - domain: input_text
 
         input_reset_temperature:
           name: ↩️ Reset Temperature
@@ -1842,16 +1876,32 @@ trigger:
       seconds: 5
     id: temperature_change_available
 
-  # Re-evaluate the current schedule after a stable thermostat target.
-  # Automatic target changes may also fire this; applying the current plan is idempotent.
+  # Native deadline plus recovery when HA was offline at the deadline.
+  - trigger: time
+    at: !input input_manual_until
+    id: temperature_change_manual_deadline
+  - trigger: time_pattern
+    minutes: "/1"
+    id: manual_recovery_tick
+  - trigger: event
+    event_type: ahc_manual_update
+    event_data:
+      automation: "{{ this.entity_id }}"
+    id: temperature_change_manual_update
   - trigger: state
     entity_id: !input input_trvs
-    attribute: temperature
-    not_to:
-      - null
+    attribute: target_temp_low
+    not_to: [null]
     for:
-      minutes: !input input_manual_temperature_minutes
-    id: temperature_change_manual_expired
+      seconds: 5
+    id: manual_range_low
+  - trigger: state
+    entity_id: !input input_trvs
+    attribute: target_temp_high
+    not_to: [null]
+    for:
+      seconds: 5
+    id: manual_range_high
 
   # physical change
   - trigger: state
@@ -2362,7 +2412,7 @@ trigger:
         {% endif %}
       {% endif %}
 
-variables:
+variables: &ahc_runtime_variables
   #####################################################################################
   ###################################### INPUTS #######################################
   #####################################################################################
@@ -2941,7 +2991,42 @@ variables:
 
   # global
   manual_temperature_minutes: !input input_manual_temperature_minutes
-  is_manual_expiry: "{{ trigger.id | default('') == 'temperature_change_manual_expired' and manual_temperature_minutes | float(0) > 0 }}"
+  manual_until_entity: !input input_manual_until
+  manual_target_entity: !input input_manual_target
+  manual_expected_entity: !input input_manual_expected
+  heating_status_entity: !input input_heating_status
+  manual_helpers_ready: >
+    {{ manual_until_entity != [] and manual_target_entity != [] and manual_expected_entity != []
+       and has_value(manual_until_entity) and has_value(manual_target_entity) and has_value(manual_expected_entity) }}
+  manual_enabled: "{{ manual_helpers_ready and manual_temperature_minutes | float(0) > 0 }}"
+  manual_until_ts: "{{ as_timestamp(states(manual_until_entity), 0) if manual_helpers_ready else 0 }}"
+  manual_active: "{{ manual_enabled and manual_until_ts > as_timestamp(now()) and is_number(states(manual_target_entity)) }}"
+  is_manual_expiry: "{{ manual_helpers_ready and manual_until_ts > 1000000000 and (manual_until_ts <= as_timestamp(now()) or not manual_enabled) }}"
+  manual_expected: "{{ states(manual_expected_entity) | from_json({}) if manual_helpers_ready else {} }}"
+  manual_attribute: >
+    {{ 'target_temp_low' if trigger.id | default('') == 'manual_range_low' else
+       'target_temp_high' if trigger.id | default('') == 'manual_range_high' else 'temperature' }}
+  manual_new_value: >
+    {{ trigger.to_state.attributes.get(manual_attribute) | float(none)
+       if trigger.id | default('') in ['temperature_change_valve_target', 'manual_range_low', 'manual_range_high']
+       and trigger.to_state is not none else none }}
+  manual_detected: >
+    {% if manual_enabled and trigger.id | default('') in ['temperature_change_valve_target', 'manual_range_low', 'manual_range_high']
+       and trigger.from_state is not none and trigger.to_state is not none
+       and trigger.from_state.state not in ['unknown', 'unavailable']
+       and trigger.to_state.state not in ['unknown', 'unavailable'] and manual_new_value is not none
+       and is_number(trigger.from_state.attributes.get(manual_attribute))
+       and trigger.from_state.attributes.get(manual_attribute) | float != manual_new_value %}
+      {% set context = trigger.to_state.context %}
+      {% set expected = manual_expected.get(trigger.entity_id, [none, none, none]) %}
+      {% set index = 1 if manual_attribute == 'target_temp_low' else 2 if manual_attribute == 'target_temp_high' else 0 %}
+      {% set own_echo = expected[index] is not none and (expected[index] | float - manual_new_value) | abs < 0.01 %}
+      {{ context.parent_id is none and
+         ((context.user_id is not none and is_ui_change_enabled) or
+          (context.user_id is none and is_physical_change_enabled and not own_echo)) }}
+    {% else %}
+      {{ false }}
+    {% endif %}
 
   last_comfort_entity_change: "{{ [input_temperature_comfort_entity] | expand | map(attribute='last_changed') | list | first | default(none) }}"
   last_eco_entity_change: "{{ [input_temperature_eco_entity] | expand | map(attribute='last_changed') | list | first | default(none) }}"
@@ -3112,13 +3197,13 @@ variables:
   set_max_temperature: "{{ is_force_max_temperature or is_liming_protection }}"
 
   is_ui_change: >
-    {{ is_ui_change_enabled and
+    {{ not manual_enabled and is_ui_change_enabled and
        trigger_id_defined and
        trigger.id == 'temperature_change_valve_target' and
        trigger.to_state.context.user_id is not none }}
 
   is_physical_change: >
-    {{ is_physical_change_enabled and
+    {{ not manual_enabled and is_physical_change_enabled and
        trigger_id_defined and
        trigger.id == 'temperature_change_valve_target' and
        trigger.to_state.context.user_id is none and
@@ -3143,12 +3228,16 @@ variables:
   is_liming_trigger: "{{ trigger_id_defined and 'temperature_change_liming_protection' in trigger.id }}"
 
   is_changes_trigger: >
-    {% if state_window %}
+    {% if trigger.id | default('') == 'manual_recovery_tick' and not is_manual_expiry %}
+      {{ false }}
+    {% elif state_window %}
       {% if trigger_id_defined and 'temperature_change_window_on' in trigger.id %}
         {{ true }}
       {% elif trigger_id_defined and 'temperature_change_window_off' not in trigger.id %}
         {{ false }}
       {% endif %}
+    {% elif is_manual_expiry %}
+      {{ true }}
     {% elif trigger.platform == none %}
       {{ true }}
     {% elif trigger_id_defined and trigger.id == 'temperature_change_valve_target' %}
@@ -3166,10 +3255,10 @@ variables:
     {% endif %}
 
   is_scene_create_trigger: >
-    {{ trigger_id_defined and (("window_on" in trigger.id and not state_party) or ("party_on" in trigger.id and not state_window)) }}
+    {{ not manual_helpers_ready and trigger_id_defined and (("window_on" in trigger.id and not state_party) or ("party_on" in trigger.id and not state_window)) }}
 
   is_scene_apply_trigger: >
-    {{ trigger_id_defined and ("window_off" in trigger.id or "party_off" in trigger.id) and not is_legacy_restore and not (state_window or state_party) }}
+    {{ not manual_helpers_ready and trigger_id_defined and ("window_off" in trigger.id or "party_off" in trigger.id) and not is_legacy_restore and not (state_window or state_party) }}
 
   is_scene_destroy_trigger: >
     {{ (is_change_trigger or trigger.id == 'temperature_change_heating_adjustment') and (state_window or state_party) }}
@@ -3250,6 +3339,8 @@ variables:
       {{ iif(party_temp != none, party_temp, temperature_comfort) }}
     {% elif is_frost_protection %}
       {{ input_frost_protection_temp }}
+    {% elif manual_active %}
+      {{ states(manual_target_entity) | float }}
     {% else %}
       {{ iif(set_comfort, iif(is_away, temperature_away, temperature_comfort), temperature_eco) }}
     {% endif %}
@@ -3728,10 +3819,10 @@ variables:
     {{ n.dict }}
 
 conditions:
-  - condition: template
-    value_template: "{{ trigger.id | default('') != 'temperature_change_manual_expired' or is_manual_expiry }}"
   - condition: or
     conditions:
+      - condition: template
+        value_template: "{{ manual_detected or is_manual_expiry or heating_status_entity != [] }}"
       - condition: template
         value_template: "{{ calibration_trigger }}"
       - condition: template
@@ -3744,6 +3835,60 @@ conditions:
         value_template: "{{ positioning_trigger }}"
 
 actions:
+  - variables: *ahc_runtime_variables
+  - if:
+      - condition: template
+        value_template: "{{ manual_detected }}"
+    then:
+      - action: input_number.set_value
+        target:
+          entity_id: "{{ manual_target_entity }}"
+        data:
+          value: "{{ manual_new_value }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: "{{ manual_until_entity }}"
+        data:
+          timestamp: "{{ as_timestamp(now()) + manual_temperature_minutes | float * 60 }}"
+      - event: ahc_manual_update
+        event_data:
+          automation: "{{ this.entity_id }}"
+      - stop: "Manual room target and persistent deadline stored"
+  - if:
+      - condition: template
+        value_template: "{{ is_manual_expiry }}"
+    then:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: "{{ manual_until_entity }}"
+        data:
+          datetime: "2000-01-01 00:00:00"
+  - if:
+      - condition: template
+        value_template: "{{ heating_status_entity != [] }}"
+    then:
+      - variables:
+          heating_reason: >
+            {% if not allow_changes %}Messwerte fehlen – Regelung pausiert
+            {% elif not state_ahc %}Heizfreigabe aus
+            {% elif set_max_temperature %}Maximalbetrieb / Ventilpflege
+            {% elif state_window %}Fenster offen – abgesenkt / aus
+            {% elif state_party %}Party / feste Temperatur
+            {% elif is_frost_protection %}Frostschutz
+            {% elif manual_active %}Manuell · {{ states(manual_target_entity) }} °C
+            {% elif is_force_eco_temperature %}Eco · zentral erzwungen
+            {% elif is_away %}Comfort · Abwesenheitsabsenkung
+            {% elif set_comfort %}Comfort · Zeitplan / Anwesenheit
+            {% else %}Eco · Zeitplan / Abwesenheit{% endif %}
+      - if:
+          - condition: template
+            value_template: "{{ states(heating_status_entity) != heating_reason }}"
+        then:
+          - action: input_text.set_value
+            target:
+              entity_id: "{{ heating_status_entity }}"
+            data:
+              value: "{{ heating_reason }}"
   - variables:
       is_delayed: "{{ not (not is_uptime_defined or (now() | as_datetime - states(up_time_sensor) | as_datetime) > timedelta(**input_startup_delay)) }}"
   - action: system_log.write
@@ -4056,6 +4201,17 @@ actions:
 
                     - if:
                         - condition: template
+                          value_template: "{{ manual_helpers_ready }}"
+                      then:
+                        - action: input_text.set_value
+                          target:
+                            entity_id: "{{ manual_expected_entity }}"
+                          data:
+                            value: >
+                              {% set previous = states(manual_expected_entity) | from_json({}) %}
+                              {{ dict(previous, **{thermostat: [temp_target | float(none), temp_target_low | float(none), temp_target_high | float(none)]}) | to_json }}
+                    - if:
+                        - condition: template
                           value_template: "{{ states(thermostat) | lower != mode | lower  }}"
                       then:
                         - action: climate.set_hvac_mode
@@ -4122,3 +4278,4 @@ actions:
         then: !input "input_custom_action"
 
 mode: queued
+
